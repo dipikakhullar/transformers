@@ -1,28 +1,25 @@
 name: Claude Code PR Review
 
 on:
-  pull_request:
+  pull_request_target:
     types: [opened, synchronize, reopened]
   issue_comment:
     types: [created]
 
 permissions:
+  id-token: write
   contents: write
   pull-requests: write
   issues: write
 
 jobs:
   review:
-    # Run automatically on PR events OR when someone comments "@claude-code please review"
-    if: >
-      github.event_name == 'pull_request' ||
-      (github.event_name == 'issue_comment' &&
-       contains(github.event.comment.body, '@claude-code please review'))
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
 
       - name: Run Claude Code Action
@@ -30,9 +27,9 @@ jobs:
         with:
           provider: anthropic
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ github.token }}
           mode: review
-          # Optional: customize the instruction Claude follows for every PR
           prompt: |
-            Review this pull request thoroughly. Point out correctness, security, performance,
-            and style issues. Leave inline comments with concrete suggestions. If safe, approve;
-            otherwise request changes with a concise checklist.
+            Review this pull request thoroughly. Focus on correctness, security,
+            performance, and style. Leave inline comments with concrete fixes.
+            Approve if safe; otherwise request changes with a checklist.
