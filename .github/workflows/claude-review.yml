@@ -19,6 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          # IMPORTANT: review the PR’s head commit, not base
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
 
@@ -28,7 +29,10 @@ jobs:
           provider: anthropic
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ github.token }}
-          mode: review
+          # Optional, but helps us debug next errors
+          show_full_output: true
+          # Optional: let comments also trigger reviews (if you want)
+          # trigger_phrase: "@claude-code please review"
           prompt: |
             Review this pull request thoroughly. Focus on correctness, security,
             performance, and style. Leave inline comments with concrete fixes.
