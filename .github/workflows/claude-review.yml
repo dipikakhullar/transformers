@@ -1,0 +1,176 @@
+# file belongs in transformers/.github/workflows/claude-review.yml
+name: Claude PR Comment Review
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write
+
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    timeout-minutes: 12
+    # Only run when someone mentions @claude on a PR
+    if: contains(github.event.comment.body, '@claude') && (github.event_name == 'pull_request_review_comment' || (github.event_name == 'issue_comment' && github.event.issue.pull_request != null))
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1) Full history so diffs work
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 2) PR number for either event shape
+      - name: Derive PR number
+        id: prnum
+        shell: bash
+        run: |
+          PR="${{ github.event.pull_request.number }}"
+          if [ -z "$PR" ] || [ "$PR" = "null" ]; then PR="${{ github.event.issue.number }}"; fi
+          [[ "$PR" =~ ^[0-9]+$ ]] || { echo "Could not determine PR number"; exit 1; }
+          echo "pr=$PR" >> "$GITHUB_OUTPUT"
+
+      # 3) Check out the PR head (not main)
+      - name: Checkout PR head
+        shell: bash
+        run: |
+          PR="${{ steps.prnum.outputs.pr }}"
+          git fetch origin "pull/$PR/head:pr-$PR"
+          git checkout "pr-$PR"
+          git log --oneline -3
+
+      # 4) Changed files (passed to prompt)
+      - name: Determine changed files
+        id: changes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          PR="${{ steps.prnum.outputs.pr }}"
+          files=$(gh pr view "$PR" --json files --jq '.files[].path' | tr '\n' ' ' || true)
+          echo "files=$files" >> "$GITHUB_OUTPUT"
+
+      # 5) Preflight: can we comment?
+      - name: Preflight - can post a PR comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          PR="${{ steps.prnum.outputs.pr }}"
+          gh pr comment "$PR" --body ":rocket: Claude review starting..."
+
+      # 6) (Optional) speed-up for Bun runtime used internally by the action
+      - name: Cache Bun
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun
+          key: bun-1.2.11
+
+      # 7) Run Claude (this build writes a JSON report; it doesn't auto-comment)
+      - name: Run Claude Code Action
+        id: claude
+        uses: anthropics/claude-code-action@v1.0.6
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          prompt: |
+            You are reviewing a GitHub pull request. Review only these changed files:
+            ${{ steps.changes.outputs.files }}
+          
+            Review policy:
+            - Focus on **correctness, security, and major functional risks**.
+            - **Ignore** stylistic, documentation, formatting, naming, or minor readability issues.
+            - Only flag problems that would **break code, tests, security, or data integrity**.
+            - If there are no major issues, respond exactly: "✅ LGTM. Approved for merge."
+          
+            Output format:
+            - If you find blockers, list them clearly and briefly.
+            - Do not comment on files that only contain README or documentation edits.
+
+      # 8) Post Claude's summary back to the PR from the saved JSON
+      - name: Post Claude report to PR
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PR="${{ steps.prnum.outputs.pr }}"
+          REPORT_JSON="/home/runner/work/_temp/claude-execution-output.json"
+      
+          if [ ! -f "$REPORT_JSON" ]; then
+            echo "No Claude report found at $REPORT_JSON; skipping."
+            exit 0
+          fi
+      
+          # Object shape: { "result": "..." }  OR  array-of-turns
+          if jq -e 'type=="object" and has("result")' "$REPORT_JSON" >/dev/null 2>&1; then
+            BODY="$(jq -r '.result' "$REPORT_JSON")"
+          elif jq -e 'type=="array"' "$REPORT_JSON" >/dev/null 2>&1; then
+            BODY="$(jq -r '
+              [
+                .[] | .result?,
+                (.[]?.message?.content[]? | select(.type=="text") | .text?)
+              ] | map(select(.!=null and .!="")) | unique | join("\n\n")
+            ' "$REPORT_JSON")"
+          else
+            BODY=""
+          fi
+      
+          if [ -z "${BODY:-}" ] || [ "$BODY" = "null" ]; then
+            BODY="(Claude report attached)\n\n\`\`\`json\n$(head -c 60000 "$REPORT_JSON")\n\`\`\`"
+          fi
+      
+          gh pr comment "$PR" --body "$BODY"
+      
+      # 9) Auto-approve ONLY if Claude explicitly green-lights (read JSON again; no outputs needed)
+      - name: Approve PR if Claude LGTM
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_REVIEW }}  # PAT with repo scope or fine-grained: Pull requests=Write, Contents=Read
+        shell: bash
+        run: |
+          set -euo pipefail
+          PR="${{ steps.prnum.outputs.pr }}"
+          REPORT_JSON="/home/runner/work/_temp/claude-execution-output.json"
+      
+          if [ ! -f "$REPORT_JSON" ]; then
+            echo "No Claude report JSON; skipping auto-approval."
+            exit 0
+          fi
+      
+          # Extract plain text again (same logic as previous step)
+          if jq -e 'type=="object" and has("result")' "$REPORT_JSON" >/dev/null 2>&1; then
+            BODY="$(jq -r '.result' "$REPORT_JSON")"
+          elif jq -e 'type=="array"' "$REPORT_JSON" >/dev/null 2>&1; then
+            BODY="$(jq -r '
+              [
+                .[] | .result?,
+                (.[]?.message?.content[]? | select(.type=="text") | .text?)
+              ] | map(select(.!=null and .!="")) | unique | join("\n\n")
+            ' "$REPORT_JSON")"
+          else
+            BODY=""
+          fi
+      
+          if [ -z "${BODY:-}" ] || [ "$BODY" = "null" ]; then
+            echo "Empty Claude body; skipping auto-approval."
+            exit 0
+          fi
+      
+          # Approve only on an explicit green-light phrase
+          if printf '%s\n' "$BODY" | grep -Eiq '(^|[^A-Za-z])✅ *LGTM\.? *Approved for merge\.?($|[^A-Za-z])|^no material risk found$' ; then
+            echo "Claude indicated approval; submitting Approve review."
+            gh pr review "$PR" --approve --body "Auto-approved based on Claude review."
+          else
+            echo "Claude did not green-light; skipping auto-approval."
+          fi
